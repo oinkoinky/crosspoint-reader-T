@@ -7,6 +7,7 @@
 #include <esp_sleep.h>
 #include <soc/soc_caps.h>
 
+#include <algorithm>
 #include <cassert>
 
 #include "HalGPIO.h"
@@ -48,11 +49,14 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   }
 
   auto wifiMode = WiFi.getMode();
+  int lowFreq = LOW_POWER_FREQ;
 #ifdef UNITLINK_RADIO
-  // The unit link keeps the radio on without joining anything; 80 MHz is enough for that. Anything more (joined to
-  // an access point, scanning, an access point of our own) still forces full speed.
+  // The unit link keeps the radio on without joining anything. The radio cannot run below 80 MHz, and boards without
+  // PSRAM idle at 10 MHz, so while the link is up the idle speed is raised to 80 MHz instead of full speed. Anything
+  // more (joined to an access point, scanning, an access point of our own) still forces full speed.
   if (wifiMode == WIFI_MODE_STA && WiFi.status() != WL_CONNECTED && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
     wifiMode = WIFI_MODE_NULL;
+    lowFreq = std::max(lowFreq, 80);
   }
 #endif
   if (wifiMode != WIFI_MODE_NULL) {
@@ -67,8 +71,8 @@ void HalPowerManager::setPowerSaving(bool enabled) {
 
   if (mode == None && enabled && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");
-    if (!setCpuFrequencyMhz(LOW_POWER_FREQ)) {
-      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", LOW_POWER_FREQ);
+    if (!setCpuFrequencyMhz(lowFreq)) {
+      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", lowFreq);
       xSemaphoreGive(modeMutex);
       return;
     }

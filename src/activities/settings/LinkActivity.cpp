@@ -4,9 +4,12 @@
 #include <I18n.h>
 #include <Logging.h>
 
+#include <algorithm>
+
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
+#include "activities/reader/ReaderUtils.h"
 #include "fontIds.h"
 #include "util/UnitLinkService.h"
 
@@ -64,21 +67,29 @@ void LinkActivity::loop() {
     return;
   }
 
+  // The reader's own page buttons: the side buttons and the front Left/Right buttons.
+  const auto turn = ReaderUtils::detectPageTurn(mappedInput);
   if (role == unitlink::Role::Left) {
-    // Test page: stands in for the reader's page until the reader drives the link.
-    bool changed = false;
-    if (mappedInput.wasPressed(MappedInputManager::Button::PageForward)) {
-      testPage++;
-      changed = true;
-    } else if (mappedInput.wasPressed(MappedInputManager::Button::PageBack) && testPage > 0) {
-      testPage--;
-      changed = true;
+    // Test page: stands in for the reader's page until the reader drives the link. Either unit can turn it: this
+    // unit's buttons, and the right unit's, which arrive as keys.
+    int delta = (turn.next ? 1 : 0) - (turn.prev ? 1 : 0);
+    unitlink::KeyAction key;
+    while (session->takeKey(key)) {
+      if (key == unitlink::KeyAction::NextPage) delta++;
+      if (key == unitlink::KeyAction::PrevPage) delta--;
     }
-    if (changed) {
+    if (delta != 0) {
+      testPage = static_cast<decltype(testPage)>(std::max(0, static_cast<int>(testPage) + delta));
       testPageKnown = true;
       session->publish(0, testPage, millis());
     }
   } else {
+    // The right unit follows the left unit's page; its buttons ask the left unit to turn.
+    if (turn.next) {
+      session->sendKey(unitlink::KeyAction::NextPage, millis());
+    } else if (turn.prev) {
+      session->sendKey(unitlink::KeyAction::PrevPage, millis());
+    }
     unitlink::PageState received;
     if (session->takeRemote(received)) {
       testPage = received.page;
