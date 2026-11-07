@@ -60,7 +60,7 @@ void LinkActivity::endLink() { UnitLinkService::get().endAndRestart(); }
 void LinkActivity::loop() {
   if (state == State::ChooseSide) {
     if (sidePopup.handleInput(mappedInput, [this] { requestUpdate(); })) return;
-    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) finish();
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) finish();
     return;
   }
 
@@ -94,9 +94,11 @@ void LinkActivity::loop() {
     requestUpdate();
   }
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+  // Act on the release, not the press: the Settings list opens its highlighted row when Confirm is released, so
+  // leaving on the press would let that release re-open this screen straight away.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     finish();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+  } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     endLink();
   }
 }
