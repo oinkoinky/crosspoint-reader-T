@@ -60,6 +60,7 @@
 #include "util/BookmarkUtil.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
+#include "util/UnitLinkService.h"
 
 namespace {
 // The X4 Pro and X4 Classic carry the X4's panel but sit outside isXteinkDevice()
@@ -233,6 +234,7 @@ EpubReaderActivity::~EpubReaderActivity() {
   if (radioReleasedForBuild.load()) bleturner::afterPaint();
 
   if (footnoteDepth > 0 && epub) saveLinkStack();
+  if (linkBookAnnounced) UnitLinkService::get().setBook("", renderer);  // no book open any more
 
   section.reset();
   CLIPPINGS.unload();
@@ -660,6 +662,7 @@ void EpubReaderActivity::loop() {
   }
 
   rememberBookOnceRendered();
+  serviceLink();
 
   // The radio stopped for a chapter build: once the render task has let go of the lock, that page
   // is on screen; once the build tick below has finished the chapter, no parser is left alive and
@@ -1001,6 +1004,12 @@ void EpubReaderActivity::loop() {
     backgroundBuildTick();
     return;
   }
+  if (linkFollower()) {
+    // The left unit turns the pages; the press goes there and the new position comes back.
+    UnitLinkService::get().linkSession().sendKey(
+        nextTriggered ? unitlink::KeyAction::NextPage : unitlink::KeyAction::PrevPage, millis());
+    return;
+  }
 
   if (handleEndOfBookPageTurn(prevTriggered, nextTriggered)) {
     return;
@@ -1077,6 +1086,16 @@ void EpubReaderActivity::jumpToPercent(int percent) {
       (spineSize == 0) ? 0.0f : static_cast<float>(targetSize - prevCumulative) / static_cast<float>(spineSize);
   pendingSpineProgress = std::clamp(pendingSpineProgress, 0.0f, 1.0f);
 
+  if (linkFollower()) {  // the left unit owns the position
+    unitlink::JumpRequest jump;
+    jump.spine = static_cast<uint16_t>(targetSpineIndex);
+    jump.kind = unitlink::JumpKind::Fraction;
+    jump.value = static_cast<uint32_t>(pendingSpineProgress * 1000000.0f);
+    UnitLinkService::get().linkSession().sendGoto(jump, millis());
+    requestUpdate();
+    return;
+  }
+
   {
     RenderLock lock;
     clearDeferredReposition();
@@ -1089,6 +1108,29 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 }
 
 void EpubReaderActivity::applyProgressChange(const ProgressChangeResult& sync) {
+  if (linkFollower()) {
+    // The left unit owns the position: it jumps and the new position comes back.
+    unitlink::JumpRequest jump;
+    int spine = sync.spineIndex;
+    int page = std::max(0, sync.page);
+    if (sync.hasVisibleTextOffset) {
+      jump.kind = unitlink::JumpKind::Offset;
+      jump.value = sync.visibleTextOffset;
+    } else if (sync.hasSavedProgress) {
+      const int totalPages = section ? section->estimatedTotalPages() : cachedChapterTotalPageCount;
+      const CrossPointPosition mapped = ProgressMapper::toCrossPoint(epub, {sync.xpath, sync.percentage}, renderer,
+                                                                     currentSpineIndex, totalPages);
+      spine = mapped.spineIndex;
+      page = std::max(0, mapped.pageNumber);
+    }
+    if (spine >= 0 && spine < epub->getSpineItemsCount()) {
+      jump.spine = static_cast<uint16_t>(spine);
+      jump.page = static_cast<uint16_t>(std::min(page, 65535));
+      UnitLinkService::get().linkSession().sendGoto(jump, millis());
+    }
+    requestUpdate();
+    return;
+  }
   if (sync.hasVisibleTextOffset && sync.spineIndex >= 0 && sync.spineIndex < epub->getSpineItemsCount()) {
     RenderLock lock;
     clearDeferredReposition();
@@ -1186,6 +1228,13 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               return;
             }
             const auto& chapterResult = std::get<ChapterResult>(result.data);
+            if (linkFollower()) {  // the left unit owns the position
+              unitlink::JumpRequest jump;
+              jump.spine = static_cast<uint16_t>(std::max(0, chapterResult.spineIndex));
+              UnitLinkService::get().linkSession().sendGoto(jump, millis());
+              requestUpdate();
+              return;
+            }
             RenderLock lock;
             clearDeferredReposition();
             currentSpineIndex = chapterResult.spineIndex;
@@ -1447,9 +1496,11 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
     RenderLock lock;
     clearDeferredReposition();
   }
+  // The left unit of a link shows two pages' worth (its own and the right unit's), so a turn moves two.
+  const int step = linkLeader() ? 2 : 1;
   if (isForwardTurn) {
-    if (section->currentPage < section->pageCount - 1 || section->isBuilding()) {
-      section->currentPage++;
+    if (section->currentPage + step < static_cast<int>(section->pageCount) || section->isBuilding()) {
+      section->currentPage += step;
       lastPageTurnTime = millis();
       return true;
     } else if (currentSpineIndex + 1 < epub->getSpineItemsCount()) {
@@ -1466,7 +1517,7 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
     }
   } else {
     if (section->currentPage > 0) {
-      section->currentPage--;
+      section->currentPage = std::max(0, section->currentPage - step);
       lastPageTurnTime = millis();
       return true;
     } else if (currentSpineIndex > 0) {
@@ -1619,6 +1670,8 @@ bool EpubReaderActivity::skipLoopDelay() {
 }
 
 void EpubReaderActivity::renderBook() {
+  // Noted before any early return: serviceLink() redraws the page when the link status moves on from this.
+  if (auto& link = UnitLinkService::get(); link.running()) shownLinkKey = link.settledStatusKey();
   currentPageLinks.clear();
   if (!epub) return;
   // A radio start in flight takes ~50 KB while the stack comes up: the page waits for it rather than
@@ -1874,12 +1927,20 @@ void EpubReaderActivity::renderBook() {
     }
   }
 
+  // The right unit of a link shows the page after the left unit's: one past the last page is a blank page, not an error.
+  const bool followerPastEnd = linkFollower() && !section->isBuilding() && section->pageCount > 0 &&
+                               section->currentPage == static_cast<int>(section->pageCount);
   if (!section->isBuilding() && section->pageCount > 0 &&
-      section->currentPage >= static_cast<int>(section->pageCount)) {
+      section->currentPage >= static_cast<int>(section->pageCount) && !followerPastEnd) {
     section->currentPage = section->pageCount - 1;
   }
 
   applyDeferredReposition();
+
+  // The left unit shows the pairs (0,1), (2,3), ...: keep its page even whatever put it here (resume, jump, ...).
+  if (linkLeader() && (section->currentPage & 1) && section->currentPage > 0) {
+    section->currentPage--;
+  }
 
   renderer.clearScreen();
 
@@ -1887,6 +1948,14 @@ void EpubReaderActivity::renderBook() {
     LOG_DBG("ERS", "No pages to render");
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_EMPTY_CHAPTER), true, EpdFontFamily::BOLD);
     renderStatusBar();
+    renderer.displayBuffer();
+    pageBufferStale = false;
+    automaticPageTurnActive = false;
+    showPendingSyncSaveError();
+    return;
+  }
+
+  if (followerPastEnd) {  // a blank page: the chapter ended on the left unit's page
     renderer.displayBuffer();
     pageBufferStale = false;
     automaticPageTurnActive = false;
@@ -1957,6 +2026,11 @@ void EpubReaderActivity::renderBook() {
     }
   }
 
+  if (linkLeader()) {
+    linkPosition.store((static_cast<uint32_t>(currentSpineIndex) << 16) | static_cast<uint16_t>(section->currentPage));
+    linkPositionDirty.store(true);
+  }
+
   showPendingSyncSaveError();
 
   if (pendingScreenshot) {
@@ -1970,6 +2044,11 @@ void EpubReaderActivity::renderBook() {
 
   if (showDictionaryMessage) {
     GUI.drawPopup(renderer, tr(STR_DICT_NO_DICT_SET));
+  }
+
+  if (auto& link = UnitLinkService::get(); link.running()) {
+    // Link not up: say why, over the page.
+    if (link.linkSession().status() != unitlink::Status::Linked) GUI.drawPopup(renderer, I18N.get(link.statusMessage()));
   }
 
   // Glyphs of a damaged .cpfont draw as blanks; say why, once per loaded font.
@@ -2816,6 +2895,15 @@ void EpubReaderActivity::handleOverlayInput() {
   const auto gotoSpine = [this](int target) {
     const int spineCount = epub->getSpineItemsCount();
     target = std::clamp(target, 0, spineCount - 1);
+    if (linkFollower()) {  // the left unit owns the position
+      if (target != currentSpineIndex) {
+        unitlink::JumpRequest jump;
+        jump.spine = static_cast<uint16_t>(target);
+        UnitLinkService::get().linkSession().sendGoto(jump, millis());
+      }
+      requestUpdate();
+      return;
+    }
     if (target != currentSpineIndex) {
       RenderLock lock;
       clearDeferredReposition();
@@ -2927,7 +3015,11 @@ void EpubReaderActivity::handleOverlayInput() {
       }
     } else if (overlay == Overlay::Contents) {
       const auto item = epub->getTocItem(panelIndex);
-      if (item.spineIndex != -1) {
+      if (item.spineIndex != -1 && linkFollower()) {  // the left unit owns the position
+        unitlink::JumpRequest jump;
+        jump.spine = static_cast<uint16_t>(item.spineIndex);
+        UnitLinkService::get().linkSession().sendGoto(jump, millis());
+      } else if (item.spineIndex != -1) {
         RenderLock lock;
         clearDeferredReposition();
         currentSpineIndex = item.spineIndex;
@@ -3342,6 +3434,7 @@ void EpubReaderActivity::loadCachedBookmarks() {
 
 void EpubReaderActivity::addBookmark() {
   if (!section || !epub) return;
+  if (linkFollower()) return;  // the left unit keeps the bookmark file; the right unit only shows its copy
   LOG_DBG("ERS", "Toggle bookmark at spine %d, page %d", currentSpineIndex, section ? section->currentPage : -1);
   int currentPage;
   int pageCount;
@@ -3472,4 +3565,115 @@ CrossPointPosition EpubReaderActivity::getCurrentPosition() const {
     localPos.hasParagraphIndex = true;
   }
   return localPos;
+}
+
+bool EpubReaderActivity::linkLeader() const {
+  auto& link = UnitLinkService::get();
+  return link.running() && link.role() == unitlink::Role::Left;
+}
+
+bool EpubReaderActivity::linkFollower() const {
+  auto& link = UnitLinkService::get();
+  return link.running() && link.role() == unitlink::Role::Right;
+}
+
+void EpubReaderActivity::announceLinkBook() {
+  if (epub) UnitLinkService::get().setBook(epub->getPath(), renderer);
+  linkBookAnnounced = true;
+}
+
+// Runs in the loop task. Tells the link which book is open, sends the left unit's position and moves the right unit to
+// the page after the left unit's.
+void EpubReaderActivity::serviceLink() {
+  auto& link = UnitLinkService::get();
+  if (!link.running()) return;
+  if (!linkBookAnnounced) {
+    announceLinkBook();
+  } else if (millis() - linkLayoutCheckMs >= 1000) {
+    // Text settings changed here: the new layout hash makes the peer check again.
+    linkLayoutCheckMs = millis();
+    link.refreshLayout(renderer);
+  }
+  // A status popup is drawn over the page while the link is not up, so a change means the page must be drawn again.
+  if (link.settledStatusKey() != shownLinkKey) requestUpdate();
+  auto& session = link.linkSession();
+  if (link.takeTextSettingsApplied()) applyReaderTextSettings();  // the other unit changed the text settings
+  if (link.takeNightApplied()) {                                  // night mode flipped; the overlay snapshot is stale
+    RenderLock lock;
+    discardOverlayPage();
+  }
+  if (linkFollower() && link.takeBookmarksUpdated()) {
+    const bool wasBookmarked = currentPageBookmarked;
+    {
+      RenderLock lock;
+      loadCachedBookmarks();
+    }
+    if (currentPageBookmarked != wasBookmarked) requestUpdate();
+  }
+  if (linkFollower()) {
+    automaticPageTurnActive = false;
+    unitlink::JumpRequest syncJump;
+    if (session.status() == unitlink::Status::Linked && link.takeSyncJump(syncJump)) {
+      session.sendGoto(syncJump, millis());
+    }
+    unitlink::PageState remote;
+    if (session.takeRemote(remote) && remote.spine < epub->getSpineItemsCount()) {
+      RenderLock lock;
+      const int target = static_cast<int>(remote.page) + 1;
+      if (remote.spine == currentSpineIndex && section) {
+        section->currentPage = target;
+      } else {
+        nextPageNumber = target;
+        currentSpineIndex = remote.spine;
+        section.reset();
+      }
+      requestUpdate();
+    }
+  } else {
+    unitlink::JumpRequest jump;
+    if (session.takeGoto(jump)) applyRemoteJump(jump);
+    unitlink::KeyAction key;
+    // One turn at a time: a turn already waiting would be overwritten by the next press, so the rest stay queued.
+    while (pendingManualTurn == 0 && session.takeKey(key)) {
+      // A bookmark toggle is not forwarded by this version's right unit; ignore one from an older build.
+      if (key == unitlink::KeyAction::ToggleBookmark) continue;
+      pendingManualTurn = key == unitlink::KeyAction::NextPage ? 1 : -1;
+    }
+  }
+  if (!linkFollower() && linkPositionDirty.exchange(false)) {
+    const uint32_t position = linkPosition.load();
+    session.publish(static_cast<uint16_t>(position >> 16), static_cast<uint16_t>(position & 0xFFFF), millis());
+  }
+}
+
+// The right unit picked a place (chapter, percent, sync): the left unit goes there and the right unit follows.
+void EpubReaderActivity::applyRemoteJump(const unitlink::JumpRequest& jump) {
+  if (!epub || jump.spine >= epub->getSpineItemsCount()) return;
+  RenderLock lock;
+  clearDeferredReposition();
+  const bool sameChapter = section && currentSpineIndex == jump.spine;
+  if (jump.kind == unitlink::JumpKind::Offset) {
+    if (sameChapter) {
+      const auto page = section->getPageForVisibleTextOffset(jump.value);
+      section->currentPage = page.value_or(jump.page);
+    } else {
+      currentSpineIndex = jump.spine;
+      pendingOffsetJump = jump.value;
+      nextPageNumber = jump.page;
+      section.reset();
+    }
+  } else if (jump.kind == unitlink::JumpKind::Fraction) {
+    pendingSpineProgress = std::clamp(static_cast<float>(jump.value) / 1000000.0f, 0.0f, 1.0f);
+    currentSpineIndex = jump.spine;
+    nextPageNumber = 0;
+    pendingPercentJump = true;
+    section.reset();
+  } else if (sameChapter) {
+    section->currentPage = jump.page;
+  } else {
+    currentSpineIndex = jump.spine;
+    nextPageNumber = jump.page;
+    section.reset();
+  }
+  requestUpdate();
 }

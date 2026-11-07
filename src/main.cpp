@@ -51,6 +51,7 @@
 #include "util/ScreenshotUtil.h"
 #include "util/SlideSwitch.h"
 #include "util/Timezones.h"
+#include "util/UnitLinkService.h"
 
 #if CROSSPOINT_VECTOR_FONTS
 // Rendering (incl. FreeType TTF rasterization) runs on the Arduino loop task.
@@ -467,6 +468,7 @@ static bool holdSleepWhileUsbPowered() {
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+  UnitLinkService::get().announceSleep();  // the other unit of a linked pair sleeps too
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   // Sleep may end in a power-off (battery death, latch); persist the clock
@@ -843,6 +845,14 @@ void setup() {
     gpio.update();
   }
 
+#ifdef UNITLINK_RADIO
+  // A linked pair comes back linked after a sleep or restart (neither does a unit that just crashed or is in recovery
+  // mode start the radio).
+  if (!rebootedFromPanic && !recoveryFirmwareMode) {
+    UnitLinkService::get().startFromSavedSide(renderer);
+  }
+#endif
+
   allowSleepAt = millis() + 2000;
 }
 
@@ -853,6 +863,8 @@ void loop() {
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   mappedInputManager.update();
+  UnitLinkService::get().tick();
+  if (!deepSleepInProgress && UnitLinkService::get().takePeerSleep()) enterDeepSleep();
 
   // Bluetooth page turner, before the USB drive's early return: a card handed to USB stops the radio
   // before anything else.

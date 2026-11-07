@@ -23,6 +23,7 @@
 #include "HomeButtonSettingsActivity.h"
 #include "KOReaderSettingsActivity.h"
 #include "KeyboardLayoutsActivity.h"
+#include "LinkActivity.h"
 #include "LanguageSelectActivity.h"
 #include "MappedInputManager.h"
 #include "OpdsServerListActivity.h"
@@ -40,6 +41,7 @@
 #include "components/UiAppHelpers.h"
 #include "fontIds.h"
 #include "util/PluginEvents.h"
+#include "util/UnitLinkService.h"
 
 namespace fui = freeink::ui;
 
@@ -81,7 +83,7 @@ SettingsSection sectionFor(const SettingInfo& setting) {
 }
 
 // Device-only action rows added per section, beyond the shared list.
-constexpr size_t EXTRA_ROWS_PER_SECTION = 6;
+constexpr size_t EXTRA_ROWS_PER_SECTION = 8;
 }  // namespace
 
 void SettingsActivity::rebuildSettings() {
@@ -137,6 +139,14 @@ void SettingsActivity::rebuildSettings() {
   addAction(SettingsSection::Network, StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync);
   addAction(SettingsSection::Network, StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser);
   addAction(SettingsSection::Network, StrId::STR_PLUGINS, SettingAction::Plugins);
+  // Two units reading one book as a spread, over the radio (the link cannot run on boards without it).
+  if (HalLink::isSupported()) {
+    addAction(SettingsSection::Network, StrId::STR_LINK_UNIT, SettingAction::LinkUnit);
+    // While the link runs, ending it takes one press instead of opening the Link screen and backing out.
+    if (UnitLinkService::get().running()) {
+      addAction(SettingsSection::Network, StrId::STR_LINK_CANCEL, SettingAction::EndLink);
+    }
+  }
 
   // OTA fetches this board's own release asset (see OtaUpdater); boards whose
   // asset isn't published yet just report no update available. The Picco's
@@ -345,6 +355,12 @@ void SettingsActivity::toggleSelectedSetting() {
       }
       case SettingAction::ClearCache:
         startActivityForResult(std::make_unique<ClearCacheActivity>(renderer, mappedInput), resultHandler);
+        break;
+      case SettingAction::LinkUnit:
+        startActivityForResult(std::make_unique<LinkActivity>(renderer, mappedInput), resultHandler);
+        break;
+      case SettingAction::EndLink:
+        UnitLinkService::get().endAndRestart();
         break;
       case SettingAction::CheckForUpdates:
         startActivityForResult(std::make_unique<OtaUpdateActivity>(renderer, mappedInput), resultHandler);

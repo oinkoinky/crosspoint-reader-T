@@ -1,0 +1,148 @@
+#pragma once
+
+#include <BookTransfer.h>
+#include <HalLink.h>
+#include <HalStorage.h>
+#include <I18n.h>
+#include <UnitLinkSession.h>
+
+#include <string>
+
+class GfxRenderer;
+
+// The link to a second unit, kept alive across screens: the Settings screen starts it, the reader tells it which book
+// is open and drives it. The pads are the USB lines, so the link ends only by restarting the unit.
+class UnitLinkService {
+ public:
+  static UnitLinkService& get();
+
+  bool running() const { return link.active(); }
+  unitlink::Role role() const { return session.role(); }
+  unitlink::Session& linkSession() { return session; }
+
+  // Starts with no book: both units pair as soon as they see each other, and setBook() narrows that to the open book.
+  // `remember`: keep the side so the link starts again on every boot (until endAndRestart()).
+  bool start(unitlink::Role role, GfxRenderer& renderer, bool remember = true);
+  // Boot: starts the link on the side saved by an earlier start(), if there is one.
+  void startFromSavedSide(GfxRenderer& renderer);
+  // Before this unit goes to deep sleep: tells the other unit to sleep too (unless it asked for this sleep).
+  void announceSleep();
+  // True once if the other unit asked for sleep.
+  bool takePeerSleep();
+  // The reader opened `epubPath`, or closed its book (empty path). The text layout is taken from the current settings.
+  void setBook(const std::string& epubPath, const GfxRenderer& renderer);
+  // Left unit: the bookmark file of `epubPath` was just written; the right unit gets a copy.
+  void bookmarksSaved(const std::string& epubPath);
+  // Right unit: true once after the left unit's bookmark file replaced this unit's.
+  bool takeBookmarksUpdated();
+  // A position picked on the right unit while the Wi-Fi sync reboots it: kept across the reboot and sent to the left
+  // unit once the link is up again.
+  static void keepSyncJump(const unitlink::JumpRequest& jump);
+  static bool takeSyncJump(unitlink::JumpRequest& jump);
+  // Right or left unit: true once after the other unit's text settings replaced this unit's. The reader must lay the
+  // page out again.
+  bool takeTextSettingsApplied();
+  // True once after night mode was changed to follow the other unit.
+  bool takeNightApplied();
+  // The text settings may have changed: announce the layout again if its hash moved.
+  void refreshLayout(const GfxRenderer& renderer);
+  // What to tell the user about the link right now (STR_LINK_LINKED when all is well).
+  StrId statusMessage() const;
+  // Changes whenever the status or the reason for a mismatch changes.
+  uint8_t statusKey() const {
+    return static_cast<uint8_t>(session.status()) | (session.incompatibleReasons() << 3) | (sending() ? 0x80 : 0);
+  }
+  // statusKey() once it has stayed the same for STATUS_SETTLE_MS: the reader redraws its status popup on this, so a
+  // link that flickers while the other unit is busy does not redraw the page again and again.
+  uint8_t settledStatusKey() const { return settledKey; }
+  // This unit served part of the open book to the other unit in the last few seconds.
+  bool sending() const { return serveLastMs != 0 && millis() - serveLastMs < SEND_SHOWN_MS; }
+  // For the Link screen's diagnostics line.
+  uint32_t bytesSent() const { return link.bytesSent(); }
+  uint32_t bytesReceived() const { return link.bytesReceived(); }
+  // -1 while no book is coming in, else how much of it has arrived (percent).
+  int receivePercent() const {
+    return !receiving ? -1
+           : receiver.total() == 0
+               ? 0
+               : static_cast<int>(static_cast<uint64_t>(receiver.received()) * 100 / receiver.total());
+  }
+  int signalDbm() const { return link.lastRssi(); }
+  // Call once per main loop pass.
+  void tick();
+  // Ends the link and restarts the unit so USB comes back.
+  // tellPeer: the other unit ends its link too.
+  void endAndRestart(bool tellPeer = true);
+
+  // Both units must derive the same ids from the same files and settings.
+  static uint32_t bookIdFor(const std::string& epubPath);
+  static uint32_t layoutHashFor(const GfxRenderer& renderer);
+
+ private:
+  UnitLinkService() : session(link) {}
+
+  HalLink link;
+  void openRequestedBook(const std::string& path);
+  void sendBookmarks();
+  void syncLayout(const GfxRenderer& renderer);
+  void applyRemoteLayout(const uint8_t* blob);
+  void applyBookmarks(const std::string& json);
+
+  std::string currentBookPath;
+  uint32_t lastPeerFresh = 0;
+  bool marksDirty = false;
+  bool marksUpdated = false;
+  GfxRenderer* gfx = nullptr;
+  uint32_t announcedLayoutHash = 0;
+  bool textSettingsApplied = false;
+  bool nightApplied = false;
+  unsigned long lastDisplaySendMs = 0;
+  unsigned long lightSaveDueMs = 0;
+  int signalAverage = 0;
+  bool caseClosed = false;
+  bool caseKnown = false;
+  bool lightOffByCase = false;
+  uint32_t lastRssiSample = 0;
+  unsigned long lastCaseChangeMs = 0;
+  unsigned long caseSinceMs = 0;
+  // Book transfer. Receiving: this unit lacks the book the paired unit has open and pulls it into "<path>.part", then
+  // renames it. Sending: the open book is served to the paired unit a request at a time.
+  class FileSink;
+  class FileSource;
+  unitlink::BookReceiver receiver;
+  unitlink::BookServer server;
+  bool receiving = false;
+  std::string receivePath;
+  HalFile receiveFile;
+  HalFile serveFile;
+  unsigned long serveLastMs = 0;
+  static constexpr unsigned long SEND_SHOWN_MS = 3000;
+  static constexpr unsigned long STATUS_SETTLE_MS =
+      6000;  // the other unit can be busy opening a book for about that long
+  uint8_t settledKey = 0;
+  uint8_t pendingKey = 0;
+  unsigned long pendingKeySince = 0;
+  unsigned long receiveStartMs = 0;
+  int receiveShownPercent = -1;
+  std::string failedReceivePath;
+  unsigned long failedReceiveMs = 0;
+  bool startReceive(const std::string& path);
+  void tickReceive(unsigned long now);
+  void tickServe();
+  void showReceiveProgress();
+  void finishReceive();
+  void abortReceive(bool failed);
+  static bool receivablePath(const std::string& path);
+  void watchCase(unsigned long now);
+  unitlink::DisplayState currentDisplay() const;
+  void applyDisplay(const unitlink::DisplayState& target, uint8_t parts, unsigned long now);
+  unsigned long layoutMismatchSinceMs = 0;
+
+  uint32_t currentBookId = 0;
+  std::string lastRequestedPath;
+  unsigned long lastRequestMs = 0;
+  unsigned long lastUartRestartMs = 0;
+  unitlink::Session session;
+  bool ending = false;
+  bool peerAskedSleep = false;
+};

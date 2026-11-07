@@ -28,6 +28,7 @@
 #include "network/WifiPowerSaveGuard.h"
 #include "util/PluginEvents.h"
 #include "util/PluginHttp.h"
+#include "util/UnitLinkService.h"
 
 namespace fui = freeink::ui;
 
@@ -97,6 +98,17 @@ void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
     }
     requestUpdate(true);
     return;
+  }
+  if (auto& link = UnitLinkService::get(); link.running() && link.role() == unitlink::Role::Right) {
+    // The right unit follows the left one: remember where the sync landed and send it there once the link is back.
+    unitlink::JumpRequest jump;
+    jump.spine = static_cast<uint16_t>(std::max(0, spineIndex));
+    jump.page = static_cast<uint16_t>(std::clamp(page, 0, 65535));
+    if (offset) {
+      jump.kind = unitlink::JumpKind::Offset;
+      jump.value = *offset;
+    }
+    UnitLinkService::keepSyncJump(jump);
   }
   returnToReader();
 }

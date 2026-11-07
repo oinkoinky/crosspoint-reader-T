@@ -20,6 +20,10 @@
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
 
+namespace unitlink {
+struct JumpRequest;
+}
+
 class EpubReaderActivity final : public ReaderActivity {
   std::shared_ptr<Epub> epub;
   std::unique_ptr<Section> section = nullptr;
@@ -58,6 +62,20 @@ class EpubReaderActivity final : public ReaderActivity {
   unsigned long lastRenderCompleteMs = 0;
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
+
+  // Two-unit link (see UnitLinkService): the left unit leads, turns pages in twos and shows page N (even); the right
+  // unit follows and shows page N+1. The render task stores the position and the loop task sends it, because the
+  // link session belongs to the loop task.
+  bool linkLeader() const;
+  bool linkFollower() const;
+  void serviceLink();
+  void applyRemoteJump(const unitlink::JumpRequest& jump);
+  void announceLinkBook();
+  std::atomic<uint32_t> linkPosition{0};  // spine << 16 | page
+  std::atomic<bool> linkPositionDirty{false};
+  bool linkBookAnnounced = false;
+  uint8_t shownLinkKey = 0xFF;  // link status the page was last drawn for
+  unsigned long linkLayoutCheckMs = 0;
   bool recentsEntryRemoved = false;
   unsigned long bookmarkMessageTime = 0UL;
   bool pendingReadFolderMove = false;
